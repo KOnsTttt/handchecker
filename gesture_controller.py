@@ -1,460 +1,486 @@
-import cv2
-import mediapipe as mp
-from mediapipe.tasks import python
-from mediapipe.tasks.python import vision
-import numpy as np
-import pickle
+# -*- coding: utf-8 -*-
+"""
+Hand Control HUD — управление системным звуком Windows жестами руки.
+
+Функция: 1 (громкость системы: режимы GESTURE / FADER).
+Бинды:   M — режим, R — запись жеста, S — сохранить, C — сброс датасета, ESC — выход.
+Фейдер:  ТОЛЬКО верхняя левая четверть кадра. Верх зоны = 100%, низ зоны = 0%.
+"""
+
 import os
+import sys
 import time
 import math
-import ctypes
+import pickle
 import threading
+
+import cv2
+import numpy as np
+import mediapipe as mp
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision
 from sklearn.neighbors import KNeighborsClassifier
-from pycaw.pycaw import AudioUtilities, ISimpleAudioVolume
+from pycaw.pycaw import AudioUtilities
 
-# --- Win32 API для управления курсором (без overhead) ---
-user32 = ctypes.windll.user32
-SCREEN_W = user32.GetSystemMetrics(0)
-SCREEN_H = user32.GetSystemMetrics(1)
+# ------------------------------- Конфигурация --------------------------------
+MODEL_PATH      = "hand_landmarker.task"
+DATASET_FILE    = "gestures_data.pkl"
+GESTURE_LABEL   = "MUTE_TOGGLE"     # класс записываемого жеста
 
-MOUSEEVENTF_LEFTDOWN = 0x0002
-MOUSEEVENTF_LEFTUP = 0x0004
-MOUSEEVENTF_RIGHTDOWN = 0x0008
-MOUSEEVENTF_RIGHTUP = 0x0010
+HOLD_TRIGGER    = 0.40              # удержание жеста до действия, сек
+PREDICT_DIST    = 0.45              # порог расстояния KNN
+SAMPLE_INTERVAL = 0.05              # интервал записи сэмплов, сек
+SMOOTHING       = 0.35              # сглаживание фейдера
 
-def win32_move_mouse(x, y):
-    user32.SetCursorPos(int(x), int(y))
+WIN_TITLE = "Hand Control HUD"
+WIN_W, WIN_H = 1280, 760
 
-def win32_lmb_down():
-    user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+FRAME_X, FRAME_Y = 24, 96           # рамка вебки
+FRAME_W, FRAME_H = 900, 506
 
-def win32_lmb_up():
-    user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+AI_INPUT_SIZE   = (256, 256)
+CAM_SIZE        = (640, 480)
 
-def win32_rmb_click():
-    user32.mouse_event(MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, 0)
-    user32.mouse_event(MOUSEEVENTF_RIGHTUP, 0, 0, 0, 0)
+MODES = ["GESTURE", "FADER"]
 
-# --- Стабильный буфер сглаживания курсора (SMA) ---
-class SmoothBuffer:
-    def __init__(self, size=7):
-        self.size = size
-        self.history_x = []
-        self.history_y = []
+# Тёмная палитра (BGR)
+COL_BG       = (32, 29, 26)
+COL_PANEL    = (52, 47, 42)
+COL_VIDEO_BG = (14, 13, 12)
+COL_BORDER   = (96, 88, 78)
+COL_TEXT     = (238, 234, 228)
+COL_DIM      = (156, 148, 138)
+COL_ACCENT   = (208, 170, 60)
+COL_GREEN    = (120, 200, 90)
+COL_RED      = (85, 85, 225)
+COL_BAR_LOW  = (120, 200, 90)       # зелёный
+COL_BAR_MID  = (60, 175, 250)       # янтарный
+COL_BAR_HIGH = (85, 85, 225)        # красный
 
-    def add(self, x, y):
-        self.history_x.append(x)
-        self.history_y.append(y)
-        if len(self.history_x) > self.size:
-            self.history_x.pop(0)
-            self.history_y.pop(0)
-        return np.mean(self.history_x), np.mean(self.history_y)
 
-mouse_filter = SmoothBuffer(size=7)
+# ------------------------------ Системное аудио ------------------------------
+class SystemAudio:
+    """Обёртка над pycaw с обработкой ошибок."""
 
-# --- Асинхронный захват кадров камеры ---
+    def __init__(self):
+        self._ctrl = None
+        try:
+            self._ctrl = AudioUtilities.GetSpeakers().EndpointVolume
+        except Exception as exc:
+            print(f"[AUDIO] Инициализация не удалась: {exc}")
+
+    @property
+    def available(self):
+        return self._ctrl is not None
+
+    def volume(self):
+        """Текущая громкость 0..1."""
+        if not self.available:
+            return 0.0
+        try:
+            return float(self._ctrl.GetMasterVolumeLevelScalar())
+        except Exception:
+            return 0.0
+
+    def set_volume(self, value):
+        if not self.available:
+            return False
+        try:
+            self._ctrl.SetMasterVolumeLevelScalar(float(np.clip(value, 0.0, 1.0)), None)
+            return True
+        except Exception as exc:
+            print(f"[AUDIO] set_volume: {exc}")
+            return False
+
+    def muted(self):
+        if not self.available:
+            return False
+        try:
+            return bool(self._ctrl.GetMute())
+        except Exception:
+            return False
+
+    def toggle_mute(self):
+        if not self.available:
+            return
+        try:
+            self._ctrl.SetMute(not self.muted(), None)
+            print(f"[AUDIO] Звук: {'ВЫКЛ' if self.muted() else 'ВКЛ'}")
+        except Exception as exc:
+            print(f"[AUDIO] toggle_mute: {exc}")
+
+
+# ---------------------------- Камера (асинхронно) ----------------------------
 class ThreadedCamera:
-    def __init__(self, src=0, width=640, height=480):
+    def __init__(self, src=0, size=CAM_SIZE):
         self.cap = cv2.VideoCapture(src, cv2.CAP_DSHOW)
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, size[0])
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, size[1])
         self.cap.set(cv2.CAP_PROP_FPS, 60)
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        self.ok = self.cap.isOpened()
         self.grabbed, self.frame = self.cap.read()
         self.started = False
-        self.read_lock = threading.Lock()
+        self.lock = threading.Lock()
 
     def start(self):
-        if self.started:
-            return None
-        self.started = True
-        self.thread = threading.Thread(target=self.update, args=())
-        self.thread.daemon = True
-        self.thread.start()
+        if self.ok and not self.started:
+            self.started = True
+            threading.Thread(target=self._update, daemon=True).start()
         return self
 
-    def update(self):
+    def _update(self):
         while self.started:
             grabbed, frame = self.cap.read()
-            with self.read_lock:
-                self.grabbed = grabbed
-                self.frame = frame
+            with self.lock:
+                self.grabbed, self.frame = grabbed, frame
 
     def read(self):
-        with self.read_lock:
+        with self.lock:
             if not self.grabbed or self.frame is None:
                 return False, None
             return True, self.frame.copy()
 
     def stop(self):
         self.started = False
-        self.thread.join()
-        self.cap.release()
-
-# --- Системное аудио Windows ---
-device = AudioUtilities.GetSpeakers()
-volume_control = device.EndpointVolume
-
-def toggle_system_mute():
-    current_mute = volume_control.GetMute()
-    volume_control.SetMute(not current_mute, None)
-    print(f"[ACTION] Общий звук: {'MUTED' if not current_mute else 'ACTIVE'}")
-
-cached_spotify_vol = None
-last_spotify_check = 0
-
-def get_spotify_volume_control():
-    global cached_spotify_vol, last_spotify_check
-    now = time.time()
-    if cached_spotify_vol is not None and (now - last_spotify_check < 3.0):
-        return cached_spotify_vol
-    
-    last_spotify_check = now
-    sessions = AudioUtilities.GetAllSessions()
-    for session in sessions:
-        if session.Process and session.Process.name().lower() == "spotify.exe":
-            cached_spotify_vol = session._ctl.QueryInterface(ISimpleAudioVolume)
-            return cached_spotify_vol
-    cached_spotify_vol = None
-    return None
-
-def set_spotify_volume(volume_scalar):
-    vol = get_spotify_volume_control()
-    if vol:
         try:
-            vol.SetMasterVolume(volume_scalar, None)
-            return True
+            self.cap.release()
         except Exception:
-            return False
-    return False
+            pass
 
-# --- MediaPipe Tasks API ---
-MODEL_PATH = "hand_landmarker.task"
-base_options = python.BaseOptions(model_asset_path=MODEL_PATH)
-options = vision.HandLandmarkerOptions(
-    base_options=base_options,
-    num_hands=1,
-    min_hand_detection_confidence=0.5,
-    min_hand_presence_confidence=0.5,
-    min_tracking_confidence=0.5,
-    running_mode=vision.RunningMode.VIDEO
-)
-detector = vision.HandLandmarker.create_from_options(options)
+
+# --------------------------- Датасет и классификатор -------------------------
+def load_dataset(path):
+    if not os.path.exists(path):
+        return {"data": [], "labels": []}
+    try:
+        with open(path, "rb") as f:
+            ds = pickle.load(f)
+        if not isinstance(ds, dict) or "data" not in ds or "labels" not in ds:
+            raise ValueError("неверный формат файла")
+        return ds
+    except Exception as exc:
+        print(f"[DATA] Ошибка загрузки: {exc}")
+        return {"data": [], "labels": []}
+
+
+def save_dataset(ds, path):
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "wb") as f:
+            pickle.dump(ds, f, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp, path)
+        return True
+    except Exception as exc:
+        print(f"[DATA] Ошибка сохранения: {exc}")
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        return False
+
+
+def train_classifier(ds):
+    data, labels = ds["data"], ds["labels"]
+    if len(data) < 5:
+        return None
+    try:
+        knn = KNeighborsClassifier(n_neighbors=min(3, len(labels)), weights="distance")
+        knn.fit(data, labels)
+        return knn
+    except Exception as exc:
+        print(f"[ML] Обучение не удалось: {exc}")
+        return None
+
+
+def normalize_landmarks(landmarks):
+    """Нормализация относительно запястья (точка 0) + масштаб по макс. отклонению."""
+    bx, by, bz = landmarks[0].x, landmarks[0].y, landmarks[0].z
+    features = []
+    for p in landmarks:
+        features.extend((p.x - bx, p.y - by, p.z - bz))
+    features = np.asarray(features, dtype=np.float32)
+    max_val = np.max(np.abs(features))
+    return features / max_val if max_val > 0 else features
+
+
+# ---------------------------------- UI утилиты -------------------------------
+FONT = cv2.FONT_HERSHEY_SIMPLEX
+
+
+def put(img, text, x, y, color=COL_TEXT, scale=0.52, th=1):
+    cv2.putText(img, text, (int(x), int(y)), FONT, scale, color, th, cv2.LINE_AA)
+
+
+def put_segment(img, text, x, y, color=COL_TEXT, scale=0.55, th=1):
+    """Текст + автоматическое продвижение X для статусных строк."""
+    put(img, text, x, y, color, scale, th)
+    (w, _), _ = cv2.getTextSize(text, FONT, scale, th)
+    return x + w + 22
+
+
+def bar_color(vol):
+    stops = [0, 50, 100]
+    b = int(np.interp(vol, stops, [COL_BAR_LOW[0], COL_BAR_MID[0], COL_BAR_HIGH[0]]))
+    g = int(np.interp(vol, stops, [COL_BAR_LOW[1], COL_BAR_MID[1], COL_BAR_HIGH[1]]))
+    r = int(np.interp(vol, stops, [COL_BAR_LOW[2], COL_BAR_MID[2], COL_BAR_HIGH[2]]))
+    return (b, g, r)
+
 
 HAND_CONNECTIONS = [
     (0, 1), (1, 2), (2, 3), (3, 4),
     (0, 5), (5, 6), (6, 7), (7, 8),
     (5, 9), (9, 10), (10, 11), (11, 12),
     (9, 13), (13, 14), (14, 15), (15, 16),
-    (13, 17), (17, 18), (18, 19), (19, 20), (0, 17)
+    (13, 17), (17, 18), (18, 19), (19, 20), (0, 17),
 ]
 
-DATASET_FILE = "gestures_data.pkl"
 
-if os.path.exists(DATASET_FILE):
-    with open(DATASET_FILE, "rb") as f:
-        dataset = pickle.load(f)
-else:
-    dataset = {"data": [], "labels": []}
+def draw_hand(canvas, pts):
+    for p1, p2 in HAND_CONNECTIONS:
+        cv2.line(canvas, pts[p1], pts[p2], COL_ACCENT, 1, cv2.LINE_AA)
+    for i, pt in enumerate(pts):
+        color = COL_RED if i in (4, 8, 12, 16, 20) else COL_GREEN
+        cv2.circle(canvas, pt, 3, color, -1, cv2.LINE_AA)
 
-def train_classifier():
-    labels_set = set(dataset["labels"])
-    if len(labels_set) >= 2 and len(dataset["data"]) >= 20:
-        knn = KNeighborsClassifier(n_neighbors=5, algorithm='ball_tree')
-        knn.fit(dataset["data"], dataset["labels"])
-        return knn
-    return None
 
-def normalize_landmarks(landmarks):
-    base_x, base_y, base_z = landmarks[0].x, landmarks[0].y, landmarks[0].z
-    features = []
-    for lm in landmarks:
-        features.extend([lm.x - base_x, lm.y - base_y, lm.z - base_z])
-    features = np.array(features, dtype=np.float32)
-    max_val = np.max(np.abs(features))
-    return features / max_val if max_val > 0 else features
+# ----------------------------------- Init ------------------------------------
+try:
+    options = vision.HandLandmarkerOptions(
+        base_options=mp_python.BaseOptions(model_asset_path=MODEL_PATH),
+        num_hands=1,
+        min_hand_detection_confidence=0.5,
+        min_hand_presence_confidence=0.5,
+        min_tracking_confidence=0.5,
+        running_mode=vision.RunningMode.VIDEO,
+    )
+    detector = vision.HandLandmarker.create_from_options(options)
+except Exception as exc:
+    print(f"[MP] Не удалось загрузить модель '{MODEL_PATH}': {exc}")
+    sys.exit(1)
 
-classifier = train_classifier()
+audio = SystemAudio()
+dataset = load_dataset(DATASET_FILE)
+classifier = train_classifier(dataset)
 
-threaded_cam = ThreadedCamera(src=0, width=640, height=480).start()
-time.sleep(0.5)
+cam = ThreadedCamera().start()
+time.sleep(0.4)
 
-MODES = ["AIR_MOUSE", "GESTURE_MUTE", "FADER_SYSTEM", "FADER_SPOTIFY"]
-current_mode_idx = 0
+cv2.namedWindow(WIN_TITLE, cv2.WINDOW_NORMAL)
+cv2.resizeWindow(WIN_TITLE, WIN_W, WIN_H)
+cv2.setWindowProperty(WIN_TITLE, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_NORMAL)
 
-current_stable_gesture = None
-gesture_start_time = 0
-HOLD_DURATION_TRIGGER = 0.25
-action_executed = False
+BINDS_TEXT = "[M] Mode   [R] Record   [S] Save   [C] Reset   [ESC] Exit"
 
-# Координаты мыши
-prev_mouse_x, prev_mouse_y = SCREEN_W // 2, SCREEN_H // 2
-MARGIN_X = 120
-MARGIN_Y = 100
-is_lmb_down = False
-last_rmb_time = 0
+mode_idx = 0
+recording = False
+rec_samples = 0
+last_sample_t = 0.0
+save_msg, save_msg_t = "", 0.0
 
-# Фейдер
-is_pinched = False
-SMOOTHING = 0.35
-current_vol = volume_control.GetMasterVolumeLevelScalar() * 100
-FADER_TOP = 80
-FADER_BOTTOM = 400
+stable_g, g_start, acted = None, 0.0, False
+pinched, drag_vol = False, 0.0
 
-prev_time = time.time()
-recording_class = None
-last_sample_time = 0
-SAMPLE_INTERVAL = 0.05
+fps = 60.0
+prev_t = time.time()
 
-COLOR_CYAN = (255, 255, 0)
-COLOR_GREEN = (0, 255, 0)
-COLOR_RED = (0, 0, 255)
-COLOR_MAGENTA = (255, 0, 255)
-COLOR_SPOTIFY = (30, 215, 96)
-COLOR_YELLOW = (0, 255, 255)
-COLOR_BG_BOX = (25, 25, 25)
-COLOR_BUTTON = (50, 50, 50)
-COLOR_BUTTON_ACTIVE = (0, 180, 255)
-
-BTN_RECT = [390, 12, 625, 48]
-
-def on_mouse_click(event, x, y, flags, param):
-    global current_mode_idx, is_pinched, is_lmb_down
-    if event == cv2.EVENT_LBUTTONDOWN:
-        if BTN_RECT[0] <= x <= BTN_RECT[2] and BTN_RECT[1] <= y <= BTN_RECT[3]:
-            current_mode_idx = (current_mode_idx + 1) % len(MODES)
-            is_pinched = False
-            if is_lmb_down:
-                win32_lmb_up()
-                is_lmb_down = False
-
-cv2.namedWindow("Hand Vision - Gesture HUD")
-cv2.setMouseCallback("Hand Vision - Gesture HUD", on_mouse_click)
-
-AI_INPUT_SIZE = (256, 256)
-
+# --------------------------------- Главный цикл -------------------------------
 while True:
-    ret, frame = threaded_cam.read()
-    if not ret or frame is None:
-        continue
+    ret, bgr = cam.read()
+    now = time.time()
+    dt = now - prev_t
+    prev_t = now
+    fps = 0.9 * fps + 0.1 * (1.0 / dt if dt > 0 else fps)
 
-    frame = cv2.flip(frame, 1)
-    h, w, _ = frame.shape
-    
-    curr_time = time.time()
-    dt = curr_time - prev_time
-    fps = 1 / dt if dt > 0 else 60
-    prev_time = curr_time
+    canvas = np.full((WIN_H, WIN_W, 3), COL_BG, dtype=np.uint8)
+    active_mode = MODES[mode_idx]
 
-    frame_timestamp_ms = int(curr_time * 1000)
+    # ----- Рамка и видео -----
+    cv2.rectangle(canvas, (FRAME_X - 2, FRAME_Y - 2),
+                  (FRAME_X + FRAME_W + 2, FRAME_Y + FRAME_H + 2), COL_BORDER, 1)
+    canvas[FRAME_Y:FRAME_Y + FRAME_H, FRAME_X:FRAME_X + FRAME_W] = COL_VIDEO_BG
 
-    # Ресайз для инференса MediaPipe
-    small_frame = cv2.resize(frame, AI_INPUT_SIZE, interpolation=cv2.INTER_NEAREST)
-    rgb_small = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
-    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_small)
-    results = detector.detect_for_video(mp_image, frame_timestamp_ms)
+    vx, vy, vw, vh, vscale = FRAME_X, FRAME_Y, 0, 0, 1.0
+    pts, feats = None, None
 
-    detected_gesture = "NO HAND"
-    confidence = 0.0
-    raw_features = None
+    if ret and bgr is not None:
+        disp = cv2.flip(bgr, 1)
+        fh, fw = disp.shape[:2]
+        vscale = min(FRAME_W / fw, FRAME_H / fh)
+        vw, vh = int(fw * vscale), int(fh * vscale)
+        vx = FRAME_X + (FRAME_W - vw) // 2
+        vy = FRAME_Y + (FRAME_H - vh) // 2
+        canvas[vy:vy + vh, vx:vx + vw] = cv2.resize(disp, (vw, vh))
 
-    active_mode = MODES[current_mode_idx]
+        small = cv2.resize(disp, AI_INPUT_SIZE, interpolation=cv2.INTER_NEAREST)
+        rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+        mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        result = detector.detect_for_video(mp_img, int(now * 1000))
 
-    if results.hand_landmarks:
-        hand_landmarks = results.hand_landmarks[0]
-        landmark_points = [(int(lm.x * w), int(lm.y * h)) for lm in hand_landmarks]
-
-        for p1, p2 in HAND_CONNECTIONS:
-            cv2.line(frame, landmark_points[p1], landmark_points[p2], COLOR_CYAN, 1)
-
-        for idx, pt in enumerate(landmark_points):
-            if idx in [4, 8, 12, 16, 20]:
-                cv2.circle(frame, pt, 5, COLOR_RED, -1)
-            else:
-                cv2.circle(frame, pt, 3, COLOR_GREEN, -1)
-
-        raw_features = normalize_landmarks(hand_landmarks)
-
-        # 1. Мышь по стабильному суставу ладони (точка 5)
-        if active_mode == "AIR_MOUSE":
-            cv2.rectangle(frame, (MARGIN_X, MARGIN_Y), (w - MARGIN_X, h - MARGIN_Y), COLOR_YELLOW, 1)
-
-            x_thumb, y_thumb = landmark_points[4]
-            x_index_tip, y_index_tip = landmark_points[8]
-            x_mid_tip, y_mid_tip = landmark_points[12]
-            
-            # Базовая стабильная точка — основание указательного пальца (MCP, 5)
-            x_base, y_base = landmark_points[5]
-            cv2.circle(frame, (x_base, y_base), 6, (0, 255, 255), -1)
-
-            raw_screen_x = np.interp(x_base, [MARGIN_X, w - MARGIN_X], [0, SCREEN_W])
-            raw_screen_y = np.interp(y_base, [MARGIN_Y, h - MARGIN_Y], [0, SCREEN_H])
-
-            smooth_x, smooth_y = mouse_filter.add(raw_screen_x, raw_screen_y)
-
-            # Deadzone порог 5px
-            if math.hypot(smooth_x - prev_mouse_x, smooth_y - prev_mouse_y) > 5.0:
-                win32_move_mouse(smooth_x, smooth_y)
-                prev_mouse_x, prev_mouse_y = smooth_x, smooth_y
-
-            lmb_dist = math.hypot(x_index_tip - x_thumb, y_index_tip - y_thumb)
-            rmb_dist = math.hypot(x_mid_tip - x_thumb, y_mid_tip - y_thumb)
-
-            if lmb_dist < 30:
-                cv2.circle(frame, (x_index_tip, y_index_tip), 9, COLOR_GREEN, -1)
-                if not is_lmb_down:
-                    win32_lmb_down()
-                    is_lmb_down = True
-                detected_gesture = "LMB / DRAG"
-            else:
-                if is_lmb_down:
-                    win32_lmb_up()
-                    is_lmb_down = False
-                detected_gesture = "MOVING"
-
-            if rmb_dist < 30:
-                cv2.circle(frame, (x_mid_tip, y_mid_tip), 9, COLOR_MAGENTA, -1)
-                if curr_time - last_rmb_time > 0.4:
-                    win32_rmb_click()
-                    last_rmb_time = curr_time
-                    detected_gesture = "RIGHT CLICK"
-
-        # 2. Mute
-        elif active_mode == "GESTURE_MUTE":
-            if is_lmb_down:
-                win32_lmb_up()
-                is_lmb_down = False
-
-            if classifier is not None:
-                distances, _ = classifier.kneighbors([raw_features], n_neighbors=1)
-                min_dist = distances[0][0]
-                if min_dist <= 0.45:
-                    prediction = classifier.predict([raw_features])[0]
-                    proba = np.max(classifier.predict_proba([raw_features]))
-                    confidence = proba * 100
-                    detected_gesture = prediction
-                else:
-                    detected_gesture = "UNKNOWN"
-            else:
-                detected_gesture = "NEED TRAINING (R)"
-
-        # 3. Фейдеры
-        elif active_mode in ["FADER_SYSTEM", "FADER_SPOTIFY"]:
-            if is_lmb_down:
-                win32_lmb_up()
-                is_lmb_down = False
-
-            x1, y1 = landmark_points[4]
-            x2, y2 = landmark_points[8]
-            cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-
-            pinch_dist = math.hypot(x2 - x1, y2 - y1)
-            fader_color = COLOR_SPOTIFY if active_mode == "FADER_SPOTIFY" else COLOR_MAGENTA
-
-            if pinch_dist < 35:
-                is_pinched = True
-                detected_gesture = "DRAGGING"
-                target_vol = np.interp(cy, [FADER_TOP, FADER_BOTTOM], [100, 0])
-                current_vol = (1 - SMOOTHING) * current_vol + SMOOTHING * target_vol
-                clamped_vol = np.clip(current_vol, 0, 100)
-
-                if active_mode == "FADER_SYSTEM":
-                    volume_control.SetMasterVolumeLevelScalar(clamped_vol / 100.0, None)
-                elif active_mode == "FADER_SPOTIFY":
-                    set_spotify_volume(clamped_vol / 100.0)
-
-                cv2.circle(frame, (cx, cy), 9, COLOR_GREEN, -1)
-                cv2.line(frame, (cx, cy), (w - 60, cy), fader_color, 2)
-            else:
-                is_pinched = False
-                detected_gesture = "PINCH TO GRAB"
-                cv2.circle(frame, (cx, cy), 5, fader_color, 2)
-
-            cv2.line(frame, (x1, y1), (x2, y2), fader_color, 2)
-
+        if result.hand_landmarks:
+            lm = result.hand_landmarks[0]
+            pts = [(int(vx + p.x * vw), int(vy + p.y * vh)) for p in lm]
+            feats = normalize_landmarks(lm)
+            draw_hand(canvas, pts)
+    elif not cam.ok:
+        put(canvas, "CAMERA OFFLINE", FRAME_X + FRAME_W // 2 - 110,
+            FRAME_Y + FRAME_H // 2, COL_RED, 0.8, 2)
     else:
-        if is_lmb_down:
-            win32_lmb_up()
-            is_lmb_down = False
-        is_pinched = False
+        put(canvas, "NO SIGNAL", FRAME_X + FRAME_W // 2 - 70,
+            FRAME_Y + FRAME_H // 2, COL_DIM, 0.8, 2)
 
-    # Клавиши
-    key = cv2.waitKey(1) & 0xFF
-    
-    if key in [ord('m'), ord('M')]:
-        current_mode_idx = (current_mode_idx + 1) % len(MODES)
-        is_pinched = False
-        if is_lmb_down:
-            win32_lmb_up()
-            is_lmb_down = False
+    gesture_name = "-"
 
-    elif key in [ord('r'), ord('R')] and active_mode == "GESTURE_MUTE":
-        recording_class = "MUTE_TOGGLE"
-    elif key in [ord('n'), ord('N')] and active_mode == "GESTURE_MUTE":
-        recording_class = "NONE"
-    elif key in [ord('c'), ord('C')]:
-        dataset = {"data": [], "labels": []}
-        classifier = None
-        if os.path.exists(DATASET_FILE):
-            os.remove(DATASET_FILE)
-    else:
-        if recording_class is not None:
-            classifier = train_classifier()
-            with open(DATASET_FILE, "wb") as f:
-                pickle.dump(dataset, f)
-            recording_class = None
-
-    if recording_class and raw_features is not None:
-        if curr_time - last_sample_time > SAMPLE_INTERVAL:
-            dataset["data"].append(raw_features)
-            dataset["labels"].append(recording_class)
-            last_sample_time = curr_time
-
-    # Mute Action
-    if active_mode == "GESTURE_MUTE" and detected_gesture == "MUTE_TOGGLE":
-        if current_stable_gesture != "MUTE_TOGGLE":
-            current_stable_gesture = "MUTE_TOGGLE"
-            gesture_start_time = curr_time
-            action_executed = False
+    # ----- Логика режимов -----
+    if pts is not None and active_mode == "GESTURE":
+        if classifier is None:
+            gesture_name = "нет модели: [R] запись -> [S] сохранить"
         else:
-            elapsed = curr_time - gesture_start_time
-            progress = min(elapsed / HOLD_DURATION_TRIGGER, 1.0)
-            bar_w = int(progress * 260)
-            cv2.rectangle(frame, (20, h - 40), (280, h - 20), COLOR_BG_BOX, -1)
-            cv2.rectangle(frame, (20, h - 40), (20 + bar_w, h - 20), COLOR_GREEN, -1)
+            dist, _ = classifier.kneighbors([feats], n_neighbors=1)
+            if dist[0][0] <= PREDICT_DIST:
+                gesture_name = str(classifier.predict([feats])[0])
+            else:
+                gesture_name = "unknown"
 
-            if elapsed >= HOLD_DURATION_TRIGGER and not action_executed:
-                toggle_system_mute()
-                action_executed = True
+        # Удержание целевого жеста -> мьют
+        holding = (gesture_name == GESTURE_LABEL)
+        if holding and stable_g != GESTURE_LABEL:
+            stable_g, g_start, acted = GESTURE_LABEL, now, False
+        elif not holding:
+            stable_g, acted = None, False
+        if holding and stable_g == GESTURE_LABEL:
+            elapsed = now - g_start
+            progress = min(elapsed / HOLD_TRIGGER, 1.0)
+            bw = int(progress * 280)
+            py_ = FRAME_Y + FRAME_H + 46
+            cv2.rectangle(canvas, (FRAME_X, py_), (FRAME_X + 280, py_ + 10), COL_PANEL, -1)
+            cv2.rectangle(canvas, (FRAME_X, py_), (FRAME_X + bw, py_ + 10), COL_GREEN, -1)
+            if elapsed >= HOLD_TRIGGER and not acted:
+                audio.toggle_mute()
+                acted = True
+
+    elif pts is not None and active_mode == "FADER":
+        # Зона фейдера — верхняя левая четверть кадра. Шкала у правого края зоны.
+        zx2, zy2 = vx + vw // 2, vy + vh // 2
+        cv2.rectangle(canvas, (vx, vy), (zx2, zy2), COL_ACCENT, 1, cv2.LINE_AA)
+        put(canvas, "VOL ZONE", vx + 8, vy + 22, COL_ACCENT, 0.48)
+
+        gx = zx2 - 14
+        cv2.line(canvas, (gx, vy + 10), (gx, zy2 - 10), COL_PANEL, 1, cv2.LINE_AA)
+        for frac, lbl in ((0.0, "100"), (0.5, "50"), (1.0, "0")):
+            gy = int(vy + frac * (zy2 - vy - 20)) + 10
+            cv2.line(canvas, (gx - 6, gy), (gx + 6, gy), COL_DIM, 1, cv2.LINE_AA)
+            put(canvas, lbl, gx + 9, gy + 4, COL_DIM, 0.38)
+
+        x1, y1 = pts[4]
+        x2, y2 = pts[8]
+        cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+        pdist = math.hypot(x2 - x1, y2 - y1)
+        thr = max(26, int(36 * vscale))
+        inside = vx <= cx <= zx2 and vy <= cy <= zy2
+
+        cv2.line(canvas, (x1, y1), (x2, y2), COL_ACCENT, 2, cv2.LINE_AA)
+        if pdist < thr and inside:
+            if not pinched:
+                pinched, drag_vol = True, audio.volume() * 100
+            target = float(np.interp(cy, [vy + 10, zy2 - 10], [100, 0]))
+            drag_vol = (1 - SMOOTHING) * drag_vol + SMOOTHING * target
+            audio.set_volume(drag_vol / 100.0)
+            cv2.circle(canvas, (cx, cy), 9, COL_GREEN, -1, cv2.LINE_AA)
+            cv2.line(canvas, (cx, cy), (gx, cy), COL_GREEN, 1, cv2.LINE_AA)
+            gesture_name = f"DRAG {int(drag_vol)}%"
+        elif pdist < thr:
+            # Пинч вне зоны — игнорируем управление громкостью
+            pinched = False
+            cv2.circle(canvas, (cx, cy), 6, COL_RED, 2, cv2.LINE_AA)
+            gesture_name = "OUT OF ZONE"
+        else:
+            pinched = False
+            cv2.circle(canvas, (cx, cy), 6, COL_ACCENT, 2, cv2.LINE_AA)
+            gesture_name = f"pinch {pdist:.0f}px"
     else:
-        current_stable_gesture = None
-        action_executed = False
+        stable_g, acted, pinched = None, False, False
 
-    # UI
-    cv2.rectangle(frame, (BTN_RECT[0], BTN_RECT[1]), (BTN_RECT[2], BTN_RECT[3]), COLOR_BUTTON, -1)
-    cv2.rectangle(frame, (BTN_RECT[0], BTN_RECT[1]), (BTN_RECT[2], BTN_RECT[3]), COLOR_BUTTON_ACTIVE, 2)
-    cv2.putText(frame, f"MODE [M]: {active_mode}", (BTN_RECT[0] + 10, BTN_RECT[1] + 24),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+    # ----- Запись сэмплов (в любом режиме) -----
+    if recording and feats is not None and now - last_sample_t > SAMPLE_INTERVAL:
+        dataset["data"].append(feats)
+        dataset["labels"].append(GESTURE_LABEL)
+        rec_samples += 1
+        last_sample_t = now
 
-    if active_mode in ["FADER_SYSTEM", "FADER_SPOTIFY"]:
-        bar_color = COLOR_SPOTIFY if active_mode == "FADER_SPOTIFY" else COLOR_GREEN
-        vol_bar_h = np.interp(current_vol, [0, 100], [FADER_BOTTOM, FADER_TOP])
-        cv2.rectangle(frame, (w - 60, FADER_TOP), (w - 30, FADER_BOTTOM), COLOR_BG_BOX, -1)
-        cv2.rectangle(frame, (w - 60, int(vol_bar_h)), (w - 30, FADER_BOTTOM), bar_color, -1)
-        cv2.rectangle(frame, (w - 60, FADER_TOP), (w - 30, FADER_BOTTOM), (150, 150, 150), 2)
-        cv2.putText(frame, f"{int(current_vol)}%", (w - 75, FADER_BOTTOM + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, bar_color, 2)
-
-    mute_state = "MUTED" if volume_control.GetMute() else "UNMUTED"
-    state_color = COLOR_RED if mute_state == "MUTED" else COLOR_GREEN
-    
-    cv2.rectangle(frame, (10, 10), (250, 100), COLOR_BG_BOX, -1)
-    cv2.putText(frame, f"FPS: {int(fps)}", (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
-    cv2.putText(frame, f"Audio: {mute_state}", (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, state_color, 2)
-    cv2.putText(frame, f"Mode: {active_mode}", (20, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.5, COLOR_CYAN, 1)
-
-    cv2.imshow("Hand Vision - Gesture HUD", frame)
+    # ----- Клавиши -----
+    key = cv2.waitKey(1) & 0xFF
     if key == 27:
         break
+    elif key in (ord('m'), ord('M')):
+        mode_idx = (mode_idx + 1) % len(MODES)
+        stable_g, acted, pinched = None, False, False
+    elif key in (ord('r'), ord('R')):
+        recording, rec_samples = True, 0
+    elif key in (ord('s'), ord('S')):
+        recording = False
+        classifier = train_classifier(dataset)
+        if save_dataset(dataset, DATASET_FILE):
+            save_msg = f"saved: {len(dataset['data'])} samples, cls={'ON' if classifier else 'OFF'}"
+        else:
+            save_msg = "SAVE ERROR (см. консоль)"
+        save_msg_t = now
+    elif key in (ord('c'), ord('C')):
+        dataset = {"data": [], "labels": []}
+        classifier = None
+        recording, rec_samples = False, 0
+        try:
+            if os.path.exists(DATASET_FILE):
+                os.remove(DATASET_FILE)
+            save_msg, save_msg_t = "dataset cleared", now
+            print("[DATA] Датасет очищен, файл удалён")
+        except OSError as exc:
+            save_msg, save_msg_t = f"DELETE ERROR: {exc}", now
 
-threaded_cam.stop()
+    # ----- Шапка рамки: режим + бинды -----
+    hy = FRAME_Y - 12
+    cv2.rectangle(canvas, (FRAME_X - 2, FRAME_Y - 36),
+                  (FRAME_X + FRAME_W + 2, FRAME_Y - 2), COL_PANEL, -1)
+    put(canvas, f"MODE: {active_mode}", FRAME_X + 12, hy, COL_ACCENT, 0.62, 2)
+    (ts, _), _ = cv2.getTextSize(BINDS_TEXT, FONT, 0.52, 1)
+    put(canvas, BINDS_TEXT, FRAME_X + FRAME_W - ts - 12, hy, COL_DIM)
+
+    # ----- Строка статуса под рамкой -----
+    sy = FRAME_Y + FRAME_H + 24
+    x = FRAME_X
+    x = put_segment(canvas, f"FPS {int(fps)}", x, sy, COL_DIM)
+    x = put_segment(canvas, f"AUDIO {'N/A' if not audio.available else ('MUTED' if audio.muted() else 'ON')}",
+                    x, sy, COL_RED if audio.muted() else COL_GREEN,
+                    0.55, 2 if audio.muted() else 1)
+    x = put_segment(canvas, f"GESTURE: {gesture_name}", x, sy, COL_TEXT)
+    x = put_segment(canvas, f"DB {len(dataset['data'])}", x, sy, COL_DIM)
+    x = put_segment(canvas, "CLS READY" if classifier else "CLS NONE",
+                    x, sy, COL_GREEN if classifier else COL_RED)
+
+    if recording:
+        if int(now * 2) % 2 == 0:
+            cv2.circle(canvas, (FRAME_X + FRAME_W - 118, FRAME_Y + 22), 7, COL_RED, -1)
+        put(canvas, f"REC {rec_samples}", FRAME_X + FRAME_W - 102, FRAME_Y + 29, COL_RED, 0.62, 2)
+
+    if save_msg and now - save_msg_t < 3.0:
+        put(canvas, save_msg, WIN_W - 420, sy, COL_GREEN)
+
+    # ----- Саунд-бар внизу -----
+    vol = audio.volume() * 100.0
+    bx0, bx1 = FRAME_X, WIN_W - FRAME_X
+    by0, by1 = WIN_H - 56, WIN_H - 30
+    put(canvas, "SYSTEM VOLUME", bx0, by0 - 10, COL_DIM, 0.5)
+    cv2.rectangle(canvas, (bx0, by0), (bx1, by1), (18, 17, 16), -1)
+    fill_w = int(np.interp(vol, [0, 100], [0, bx1 - bx0]))
+    cv2.rectangle(canvas, (bx0, by0), (bx0 + fill_w, by1), bar_color(vol), -1)
+    cv2.rectangle(canvas, (bx0, by0), (bx1, by1), COL_BORDER, 1)
+    put(canvas, f"{vol:3.0f}%", bx1 - 74, by1 - 8, COL_TEXT, 0.6, 2)
+    if audio.muted():
+        put(canvas, "MUTED", (bx0 + bx1) // 2 - 44, by1 - 8, COL_RED, 0.7, 2)
+
+    cv2.imshow(WIN_TITLE, canvas)
+
+cam.stop()
 cv2.destroyAllWindows()
+print("[EXIT] Приложение завершено.")
