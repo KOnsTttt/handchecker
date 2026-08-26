@@ -19,7 +19,6 @@ def toggle_system_mute():
     volume_control.SetMute(not current_mute, None)
     print(f"[ACTION] Общий звук: {'MUTED' if not current_mute else 'ACTIVE'}")
 
-# --- Точечное управление аудиосессией Spotify ---
 def get_spotify_volume_control():
     sessions = AudioUtilities.GetAllSessions()
     for session in sessions:
@@ -89,19 +88,19 @@ cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 cap.set(cv2.CAP_PROP_FPS, 60)
 
-# Три режима работы
-MODES = ["GESTURE_MUTE", "MASTER_VOL", "SPOTIFY_VOL"]
-current_mode_idx = 0
+# Режимы: Мут, Вертикальный фейдер системы, Вертикальный фейдер Spotify
+MODES = ["GESTURE_MUTE", "FADER_SYSTEM", "FADER_SPOTIFY"]
+current_mode_idx = 1
 
 current_stable_gesture = None
 gesture_start_time = 0
 HOLD_DURATION_TRIGGER = 0.25
 action_executed = False
 
-SMOOTHING = 0.3
-current_smoothed_vol = volume_control.GetMasterVolumeLevelScalar() * 100
-vol_percent = int(current_smoothed_vol)
-vol_bar = np.interp(vol_percent, [0, 100], [380, 120])
+# Переменные для вертикального фейдера
+is_pinched = False
+SMOOTHING = 0.35
+current_vol = volume_control.GetMasterVolumeLevelScalar() * 100
 
 prev_time = time.time()
 recording_class = None
@@ -112,18 +111,23 @@ COLOR_CYAN = (255, 255, 0)
 COLOR_GREEN = (0, 255, 0)
 COLOR_RED = (0, 0, 255)
 COLOR_MAGENTA = (255, 0, 255)
-COLOR_SPOTIFY = (30, 215, 96) # Spotify Green
+COLOR_SPOTIFY = (30, 215, 96)
 COLOR_BG_BOX = (25, 25, 25)
 COLOR_BUTTON = (50, 50, 50)
 COLOR_BUTTON_ACTIVE = (0, 180, 255)
 
-BTN_RECT = [400, 12, 625, 48]
+BTN_RECT = [390, 12, 625, 48]
+
+# Рабочая зона фейдера по высоте (в пикселях кадра)
+FADER_TOP = 80      # 100% громкости (верх кадра)
+FADER_BOTTOM = 400  # 0% громкости (низ кадра)
 
 def on_mouse_click(event, x, y, flags, param):
-    global current_mode_idx
+    global current_mode_idx, is_pinched
     if event == cv2.EVENT_LBUTTONDOWN:
         if BTN_RECT[0] <= x <= BTN_RECT[2] and BTN_RECT[1] <= y <= BTN_RECT[3]:
             current_mode_idx = (current_mode_idx + 1) % len(MODES)
+            is_pinched = False
             print(f"[MODE] Режим переключен: {MODES[current_mode_idx]}")
 
 cv2.namedWindow("Hand Vision - Gesture HUD")
@@ -167,8 +171,9 @@ while cap.isOpened():
 
         raw_features = normalize_landmarks(hand_landmarks)
 
-        # 1. Режим Mute (Жестовый триггер)
+        # 1. Режим Mute
         if active_mode == "GESTURE_MUTE":
+            is_pinched = False
             if classifier is not None:
                 distances, indices = classifier.kneighbors([raw_features], n_neighbors=1)
                 min_dist = distances[0][0]
@@ -185,41 +190,49 @@ while cap.isOpened():
             else:
                 detected_gesture = "NEED TRAINING (R)"
 
-        # 2. Аналоговые режимы (Master или Spotify)
-        elif active_mode in ["MASTER_VOL", "SPOTIFY_VOL"]:
-            detected_gesture = "PINCH CONTROL"
-            x1, y1 = landmark_points[4]
-            x2, y2 = landmark_points[8]
+        # 2. Режим вертикального фейдера (FADER_SYSTEM / FADER_SPOTIFY)
+        elif active_mode in ["FADER_SYSTEM", "FADER_SPOTIFY"]:
+            x1, y1 = landmark_points[4]  # Большой палец
+            x2, y2 = landmark_points[8]  # Указательный палец
             cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
 
-            line_color = COLOR_SPOTIFY if active_mode == "SPOTIFY_VOL" else COLOR_MAGENTA
-            cv2.circle(frame, (x1, y1), 6, line_color, -1)
-            cv2.circle(frame, (x2, y2), 6, line_color, -1)
-            cv2.line(frame, (x1, y1), (x2, y2), line_color, 2)
-            cv2.circle(frame, (cx, cy), 5, COLOR_CYAN, -1)
+            pinch_dist = math.hypot(x2 - x1, y2 - y1)
+            fader_color = COLOR_SPOTIFY if active_mode == "FADER_SPOTIFY" else COLOR_MAGENTA
 
-            length = math.hypot(x2 - x1, y2 - y1)
-            target_vol = np.interp(length, [25, 170], [0, 100])
-            current_smoothed_vol = (1 - SMOOTHING) * current_smoothed_vol + SMOOTHING * target_vol
-            clamped_vol = np.clip(current_smoothed_vol, 0, 100)
+            # Порог щипка: расстояние меньше 35 пикселей
+            if pinch_dist < 35:
+                is_pinched = True
+                detected_gesture = "FADER: DRAGGING"
+                
+                # Масштабируем высоту руки (Y) в процент громкости (верх экрана -> 100%, низ -> 0%)
+                target_vol = np.interp(cy, [FADER_TOP, FADER_BOTTOM], [100, 0])
+                current_vol = (1 - SMOOTHING) * current_vol + SMOOTHING * target_vol
+                clamped_vol = np.clip(current_vol, 0, 100)
 
-            # Отправляем громкость в зависимости от режима
-            if active_mode == "MASTER_VOL":
-                volume_control.SetMasterVolumeLevelScalar(clamped_vol / 100.0, None)
-            elif active_mode == "SPOTIFY_VOL":
-                success = set_spotify_volume(clamped_vol / 100.0)
-                if not success:
-                    cv2.putText(frame, "SPOTIFY NOT RUNNING", (w - 280, 80),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLOR_RED, 2)
+                if active_mode == "FADER_SYSTEM":
+                    volume_control.SetMasterVolumeLevelScalar(clamped_vol / 100.0, None)
+                elif active_mode == "FADER_SPOTIFY":
+                    set_spotify_volume(clamped_vol / 100.0)
 
-            vol_percent = int(clamped_vol)
-            vol_bar = np.interp(clamped_vol, [0, 100], [380, 120])
+                # Рисуем лазерный ползунок от руки к шкале громкости
+                cv2.circle(frame, (cx, cy), 10, COLOR_GREEN, -1)
+                cv2.line(frame, (cx, cy), (w - 60, cy), fader_color, 2)
+            else:
+                is_pinched = False
+                detected_gesture = "PINCH TO GRAB"
+                cv2.circle(frame, (cx, cy), 6, fader_color, 2)
 
-    # Клавиатура
+            cv2.line(frame, (x1, y1), (x2, y2), fader_color, 2)
+
+    else:
+        is_pinched = False
+
+    # Обработка клавиатуры
     key = cv2.waitKey(1) & 0xFF
     
     if key in [ord('m'), ord('M')]:
         current_mode_idx = (current_mode_idx + 1) % len(MODES)
+        is_pinched = False
         print(f"[MODE] Режим переключен: {MODES[current_mode_idx]}")
 
     elif key in [ord('r'), ord('R')] and active_mode == "GESTURE_MUTE":
@@ -240,7 +253,6 @@ while cap.isOpened():
             print(f"[INFO] Сохранено. Сэмплов: {len(dataset['data'])}")
             recording_class = None
 
-    # Запись сэмплов
     if recording_class and raw_features is not None:
         if curr_time - last_sample_time > SAMPLE_INTERVAL:
             dataset["data"].append(raw_features)
@@ -271,20 +283,21 @@ while cap.isOpened():
         current_stable_gesture = None
         action_executed = False
 
-    # --- UI Индикаторы ---
-    # Кнопка переключения режимов
+    # --- UI: Кнопка переключения режимов ---
     cv2.rectangle(frame, (BTN_RECT[0], BTN_RECT[1]), (BTN_RECT[2], BTN_RECT[3]), COLOR_BUTTON, -1)
     cv2.rectangle(frame, (BTN_RECT[0], BTN_RECT[1]), (BTN_RECT[2], BTN_RECT[3]), COLOR_BUTTON_ACTIVE, 2)
     cv2.putText(frame, f"MODE [M]: {active_mode}", (BTN_RECT[0] + 10, BTN_RECT[1] + 24),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
 
-    # Вертикальный ползунок (для Master или Spotify)
-    if active_mode in ["MASTER_VOL", "SPOTIFY_VOL"]:
-        bar_color = COLOR_SPOTIFY if active_mode == "SPOTIFY_VOL" else COLOR_GREEN
-        cv2.rectangle(frame, (w - 60, 120), (w - 30, 380), COLOR_BG_BOX, -1)
-        cv2.rectangle(frame, (w - 60, int(vol_bar)), (w - 30, 380), bar_color, -1)
-        cv2.rectangle(frame, (w - 60, 120), (w - 30, 380), (150, 150, 150), 2)
-        cv2.putText(frame, f"{vol_percent}%", (w - 75, 410), cv2.FONT_HERSHEY_SIMPLEX, 0.6, bar_color, 2)
+    # Вертикальная шкала громкости (с направляющими границами)
+    if active_mode in ["FADER_SYSTEM", "FADER_SPOTIFY"]:
+        bar_color = COLOR_SPOTIFY if active_mode == "FADER_SPOTIFY" else COLOR_GREEN
+        vol_bar_h = np.interp(current_vol, [0, 100], [FADER_BOTTOM, FADER_TOP])
+        
+        cv2.rectangle(frame, (w - 60, FADER_TOP), (w - 30, FADER_BOTTOM), COLOR_BG_BOX, -1)
+        cv2.rectangle(frame, (w - 60, int(vol_bar_h)), (w - 30, FADER_BOTTOM), bar_color, -1)
+        cv2.rectangle(frame, (w - 60, FADER_TOP), (w - 30, FADER_BOTTOM), (150, 150, 150), 2)
+        cv2.putText(frame, f"{int(current_vol)}%", (w - 75, FADER_BOTTOM + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, bar_color, 2)
 
     # Верхний HUD
     mute_state = "MUTED" if volume_control.GetMute() else "UNMUTED"
@@ -293,7 +306,7 @@ while cap.isOpened():
     cv2.rectangle(frame, (10, 10), (250, 100), COLOR_BG_BOX, -1)
     cv2.putText(frame, f"FPS: {int(fps)}", (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
     cv2.putText(frame, f"Audio: {mute_state}", (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, state_color, 2)
-    cv2.putText(frame, f"Mode: {active_mode}", (20, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.5, COLOR_CYAN, 1)
+    cv2.putText(frame, f"Gesture: {detected_gesture}", (20, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.5, COLOR_CYAN, 1)
 
     cv2.imshow("Hand Vision - Gesture HUD", frame)
     if key == 27:
